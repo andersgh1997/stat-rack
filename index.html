@@ -1,0 +1,468 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#16181d">
+<title>Stat Rack</title>
+<style>
+  :root { color-scheme: light dark; --bg:#f6f7f9; --card:#fff; --ink:#16181d; --muted:#666; --line:#d9dce1; --accent:#2f6fec; --danger:#c62828; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#16181d; --card:#20232a; --ink:#e8eaed; --muted:#9aa0a6; --line:#3a3f48; --accent:#6e9bff; --danger:#ff6b6b; } }
+  * { box-sizing: border-box; }
+  body { margin:0; font:16px/1.4 system-ui, -apple-system, Segoe UI, Roboto, sans-serif; background:var(--bg); color:var(--ink); }
+  header { display:flex; align-items:center; justify-content:space-between; padding:12px 16px; border-bottom:1px solid var(--line); }
+  header h1 { font-size:20px; margin:0; }
+  main { max-width:640px; margin:0 auto; padding:16px; }
+  section.card, .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:14px; margin-bottom:14px; }
+  nav { display:flex; gap:6px; margin-bottom:14px; }
+  nav button { flex:1; }
+  nav button.active { background:var(--accent); color:#fff; border-color:var(--accent); }
+  button { font:inherit; padding:10px 14px; border-radius:8px; border:1px solid var(--line); background:var(--card); color:var(--ink); cursor:pointer; min-height:44px; }
+  button.primary { background:var(--accent); color:#fff; border-color:var(--accent); }
+  button.small { padding:4px 10px; min-height:34px; font-size:14px; }
+  button.danger { color:var(--danger); }
+  input, select { font:inherit; padding:8px; border-radius:8px; border:1px solid var(--line); background:var(--bg); color:var(--ink); min-height:40px; }
+  label { display:block; margin:8px 0 4px; color:var(--muted); font-size:14px; }
+  .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  .grow { flex:1; min-width:0; }
+  table { width:100%; border-collapse:collapse; }
+  td, th { padding:4px; text-align:left; }
+  th { color:var(--muted); font-weight:500; font-size:13px; }
+  td input { width:100%; }
+  .muted { color:var(--muted); font-size:14px; }
+  .tag { font-size:12px; border:1px solid var(--line); border-radius:999px; padding:1px 8px; color:var(--muted); }
+  #status { position:fixed; left:50%; bottom:16px; transform:translateX(-50%); max-width:90%; padding:10px 14px; border-radius:8px; background:var(--ink); color:var(--bg); display:none; }
+  #status.error { background:var(--danger); color:#fff; }
+  .ex-name { font-weight:600; }
+  ul.plain { list-style:none; padding:0; margin:0; }
+  ul.plain li { padding:8px 0; border-bottom:1px solid var(--line); }
+  ul.plain li:last-child { border-bottom:none; }
+</style>
+<script src="https://accounts.google.com/gsi/client" async defer></script>
+<script src="https://apis.google.com/js/api.js" async defer></script>
+</head>
+<body>
+<header><h1>Stat Rack</h1><span class="muted" id="logName"></span></header>
+<main>
+  <section id="viewSignin" class="card">
+    <p>Sign in with Google to open your workout log. Your data is stored in your own Google Drive.</p>
+    <p class="muted" id="signinMsg"></p>
+    <button id="btnSignin" class="primary" disabled>Loading…</button>
+  </section>
+
+  <section id="viewSetup" class="card" hidden>
+    <p>No Stat Rack log was found in your Drive. Choose (or create) a Drive folder, and Stat Rack will create its log sheet there.</p>
+    <button id="btnPick" class="primary">Choose folder</button>
+  </section>
+
+  <div id="viewApp" hidden>
+    <nav>
+      <button data-tab="log" class="active">Log workout</button>
+      <button data-tab="history">History</button>
+      <button data-tab="exercises">Exercises</button>
+    </nav>
+    <div id="tab-log"></div>
+    <div id="tab-history" hidden></div>
+    <div id="tab-exercises" hidden></div>
+  </div>
+</main>
+<div id="status"></div>
+
+<script>
+'use strict';
+
+// ===== Config =====
+const CONFIG = {
+  clientId: '89468128124-msv3r10d3g3i6cbjbceoigpg5pv3d072.apps.googleusercontent.com',
+  apiKey: 'AIzaSyBu0Mf9GsuUkqoq_T9yidLUZq-N3kclYDA',
+  appId: '89468128124',
+  scope: 'https://www.googleapis.com/auth/drive.file',
+};
+const LOG_COLUMNS = ['id', 'type', 'ref', 'v', 'written', 'data'];
+const SHEET = 'log';
+// Version written for each type today. Bump when a format changes and add an upgrader below.
+const WRITE_VERSION = { exercise: 1, workout: 1, note: 1, correction: 1, void: 1 };
+// UPGRADERS[type][v] turns data of version v into version v+1. Written once, never changed.
+const UPGRADERS = { workout: {}, exercise: {}, note: {} };
+const SET_KINDS = ['work', 'warmup', 'test']; // 'work' is stored as no kind at all
+
+// ===== State =====
+let tokenClient = null, token = null, tokenExpiry = 0;
+let logFiles = [];   // [{id, name, seq, header}]
+let rows = [];       // raw rows from all log files
+let model = { exercises: new Map(), workouts: [] };
+let draft = null; // set at startup, see the bottom of the script
+
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+function status(msg, isError = false, ms = 3000) {
+  const el = $('status');
+  el.textContent = msg; el.className = isError ? 'error' : ''; el.style.display = 'block';
+  clearTimeout(status.t);
+  if (ms) status.t = setTimeout(() => { el.style.display = 'none'; }, isError ? 8000 : ms);
+}
+function show(view) {
+  for (const v of ['viewSignin', 'viewSetup', 'viewApp']) $(v).hidden = v !== view;
+}
+
+// ===== Time and IDs =====
+const pad = n => String(n).padStart(2, '0');
+function isoLocal(d, seconds = true) {
+  const off = -d.getTimezoneOffset(), sign = off >= 0 ? '+' : '-', a = Math.abs(off);
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}` +
+    (seconds ? `:${pad(d.getSeconds())}` : '') + `${sign}${pad(Math.floor(a / 60))}:${pad(a % 60)}`;
+}
+function inputLocal(d) { // value for <input type=datetime-local>
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+function newId() {
+  const d = new Date(), chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
+  const r = crypto.getRandomValues(new Uint8Array(3));
+  const rand = Array.from(r, b => chars[b % chars.length]).join('');
+  return `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}-${rand}`;
+}
+
+// ===== Auth =====
+function waitForGoogle() {
+  if (window.google?.accounts?.oauth2 && window.gapi) {
+    tokenClient = google.accounts.oauth2.initTokenClient({
+      client_id: CONFIG.clientId,
+      scope: CONFIG.scope,
+      callback: async resp => {
+        if (resp.error) { status('Sign-in failed: ' + resp.error, true); return; }
+        token = resp.access_token;
+        tokenExpiry = Date.now() + (Number(resp.expires_in) - 60) * 1000;
+        try { await loadAll(); } catch (e) { handleError(e); }
+      },
+    });
+    const b = $('btnSignin'); b.disabled = false; b.textContent = 'Sign in with Google';
+  } else setTimeout(waitForGoogle, 100);
+}
+function signIn() { tokenClient.requestAccessToken({ prompt: '' }); }
+function needSignIn(msg) { token = null; $('signinMsg').textContent = msg || ''; show('viewSignin'); }
+
+class SignedOut extends Error {}
+async function api(url, opts = {}) {
+  if (!token || Date.now() > tokenExpiry) { needSignIn('Your session has expired. Sign in again; nothing was lost.'); throw new SignedOut(); }
+  const res = await fetch(url, { ...opts, headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json', ...(opts.headers || {}) } });
+  if (res.status === 401) { needSignIn('Your session has expired. Sign in again; nothing was lost.'); throw new SignedOut(); }
+  if (!res.ok) throw new Error(`${res.status}: ${await res.text()}`);
+  return res.status === 204 ? null : res.json();
+}
+function handleError(e) {
+  if (e instanceof SignedOut) return;
+  console.error(e); status('Error: ' + e.message, true);
+}
+
+// ===== Drive / Sheets =====
+async function findLogFiles() {
+  const q = encodeURIComponent("appProperties has { key='statrack' and value='log' } and trashed = false");
+  const r = await api(`https://www.googleapis.com/drive/v3/files?q=${q}&spaces=drive&pageSize=100&fields=files(id,name,appProperties)`);
+  return (r.files || [])
+    .map(f => ({ id: f.id, name: f.name, seq: Number(f.appProperties?.seq || 1) }))
+    .sort((a, b) => a.seq - b.seq);
+}
+
+function pickFolder() {
+  gapi.load('picker', () => {
+    const view = new google.picker.DocsView(google.picker.ViewId.FOLDERS)
+      .setIncludeFolders(true).setSelectFolderEnabled(true)
+      .setMimeTypes('application/vnd.google-apps.folder');
+    new google.picker.PickerBuilder()
+      .setAppId(CONFIG.appId).setOAuthToken(token).setDeveloperKey(CONFIG.apiKey)
+      .addView(view).setTitle('Choose a folder for your Stat Rack log')
+      .setCallback(async data => {
+        if (data.action !== google.picker.Action.PICKED) return;
+        try {
+          status('Creating your log…', false, 0);
+          await createLogFile(data.docs[0].id, 1);
+          await loadAll();
+          status('Log created.');
+        } catch (e) { handleError(e); }
+      })
+      .build().setVisible(true);
+  });
+}
+
+async function createLogFile(folderId, seq) {
+  const file = await api('https://www.googleapis.com/drive/v3/files?fields=id,name', {
+    method: 'POST',
+    body: JSON.stringify({
+      name: `Stat Rack log-${seq}`,
+      mimeType: 'application/vnd.google-apps.spreadsheet',
+      parents: [folderId],
+      appProperties: { statrack: 'log', seq: String(seq) },
+    }),
+  });
+  const ss = await api(`https://sheets.googleapis.com/v4/spreadsheets/${file.id}?fields=sheets.properties`);
+  const sheetId = ss.sheets[0].properties.sheetId;
+  // Rename the first tab to "log" and drop unused cells (blank cells count toward the 10M limit).
+  await api(`https://sheets.googleapis.com/v4/spreadsheets/${file.id}:batchUpdate`, {
+    method: 'POST',
+    body: JSON.stringify({ requests: [{ updateSheetProperties: {
+      properties: { sheetId, title: SHEET, gridProperties: { rowCount: 1, columnCount: LOG_COLUMNS.length } },
+      fields: 'title,gridProperties.rowCount,gridProperties.columnCount',
+    } }] }),
+  });
+  await api(`https://sheets.googleapis.com/v4/spreadsheets/${file.id}/values/${SHEET}!A1?valueInputOption=RAW`, {
+    method: 'PUT', body: JSON.stringify({ values: [LOG_COLUMNS] }),
+  });
+  return file;
+}
+
+async function readLogFile(f) {
+  const r = await api(`https://sheets.googleapis.com/v4/spreadsheets/${f.id}/values/${SHEET}?valueRenderOption=UNFORMATTED_VALUE`);
+  const values = r.values || [];
+  const header = (values[0] || []).map(h => String(h).trim());
+  for (const c of LOG_COLUMNS) if (!header.includes(c)) throw new Error(`${f.name} is missing the "${c}" column`);
+  f.header = header;
+  const col = Object.fromEntries(header.map((h, i) => [h, i]));
+  return values.slice(1).map((v, i) => {
+    const row = { file: f.id, line: i + 2, id: String(v[col.id] ?? ''), type: String(v[col.type] ?? ''),
+      ref: String(v[col.ref] ?? ''), v: Number(v[col.v]), written: String(v[col.written] ?? ''), raw: v[col.data], ok: true };
+    try { row.data = JSON.parse(row.raw); } catch { row.ok = false; console.warn(`Unreadable data in ${f.name} row ${row.line}`); }
+    if (!row.id) row.ok = false;
+    return row;
+  });
+}
+
+async function loadAll() {
+  status('Loading…', false, 0);
+  logFiles = await findLogFiles();
+  if (!logFiles.length) { show('viewSetup'); status('Signed in.'); return; }
+  rows = [];
+  for (const f of logFiles) rows.push(...await readLogFile(f));
+  $('logName').textContent = logFiles.at(-1).name;
+  rebuild();
+  show('viewApp');
+  renderAll();
+  const bad = rows.filter(r => !r.ok).length;
+  if (bad) status(`${bad} row(s) could not be read and were skipped. See the browser console.`, true);
+  else status('Loaded.');
+}
+
+// The only write the app ever makes: add one row at the end of the newest log file.
+async function appendRow(type, ref, data) {
+  const target = logFiles.at(-1);
+  const row = { id: newId(), type, ref: ref || '', v: WRITE_VERSION[type], written: isoLocal(new Date()), data: JSON.stringify(data) };
+  const values = [target.header.map(h => (h in row ? row[h] : ''))];
+  await api(`https://sheets.googleapis.com/v4/spreadsheets/${target.id}/values/${SHEET}:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS`, {
+    method: 'POST', body: JSON.stringify({ values }),
+  });
+  rows.push({ ...row, file: target.id, data, raw: row.data, ok: true });
+  rebuild();
+  renderAll();
+  return row.id;
+}
+
+// ===== Reading the log into a model =====
+function setPath(obj, path, value) {
+  const parts = String(path).split('.');
+  let cur = obj;
+  for (let i = 0; i < parts.length - 1; i++) {
+    cur = cur?.[/^\d+$/.test(parts[i]) ? Number(parts[i]) : parts[i]];
+    if (cur == null || typeof cur !== 'object') return false;
+  }
+  const last = parts.at(-1);
+  cur[/^\d+$/.test(last) ? Number(last) : last] = value;
+  return true;
+}
+function upgrade(type, v, data) {
+  let cur = v;
+  while (UPGRADERS[type]?.[cur]) { data = UPGRADERS[type][cur](data); cur++; }
+  return data;
+}
+const time = s => Date.parse(s) || 0;
+
+function rebuild() {
+  const good = rows.filter(r => r.ok);
+  // 1. Voids (a void can itself be voided, which undoes it)
+  const voidsOf = new Map();
+  for (const r of good) if (r.type === 'void') { if (!voidsOf.has(r.ref)) voidsOf.set(r.ref, []); voidsOf.get(r.ref).push(r); }
+  const memo = new Map();
+  const isVoided = (id, depth = 0) => {
+    if (depth > 100) return false;
+    if (memo.has(id)) return memo.get(id);
+    const res = (voidsOf.get(id) || []).some(v => !isVoided(v.id, depth + 1));
+    memo.set(id, res); return res;
+  };
+  const live = good.filter(r => !isVoided(r.id));
+  // 2. Corrections on the original format, oldest first
+  const items = new Map();
+  for (const r of live) if (r.type === 'exercise' || r.type === 'workout') items.set(r.id, { ...r, data: structuredClone(r.data) });
+  for (const c of live.filter(r => r.type === 'correction').sort((a, b) => time(a.written) - time(b.written))) {
+    const t = items.get(c.ref);
+    if (t && c.data && 'path' in c.data) setPath(t.data, c.data.path, c.data.value);
+  }
+  // 3. Upgrade to the newest format (in memory only)
+  const exercises = new Map(), workouts = [];
+  for (const it of items.values()) {
+    const data = upgrade(it.type, it.v, it.data);
+    if (it.type === 'exercise') exercises.set(it.id, { id: it.id, ...data });
+    else workouts.push({ id: it.id, written: it.written, ...data, notes: [] });
+  }
+  // 4. Notes
+  const byId = new Map(workouts.map(w => [w.id, w]));
+  for (const n of live.filter(r => r.type === 'note')) byId.get(n.ref)?.notes.push({ id: n.id, ...upgrade('note', n.v, n.data) });
+  workouts.sort((a, b) => time(b.start) - time(a.start));
+  model = { exercises, workouts };
+}
+
+// ===== Draft (survives a reload or a locked phone mid-workout) =====
+function newDraft() { return { start: inputLocal(new Date()), exercises: [] }; }
+function loadDraft() { try { return JSON.parse(localStorage.getItem('statrack.draft')) || newDraft(); } catch { return newDraft(); } }
+function saveDraft() { try { localStorage.setItem('statrack.draft', JSON.stringify(draft)); } catch {} }
+
+// ===== Rendering =====
+function exName(id) { return model.exercises.get(id)?.name ?? '(unknown exercise)'; }
+function sortedExercises() { return [...model.exercises.values()].sort((a, b) => a.name.localeCompare(b.name)); }
+function renderAll() { renderLog(); renderHistory(); renderExercises(); }
+
+function renderLog() {
+  const exList = sortedExercises();
+  let html = `<div class="card"><label>Start</label><input type="datetime-local" id="dStart" value="${esc(draft.start)}">`;
+  html += `<button class="small" id="dNow" style="margin-left:6px">Now</button></div>`;
+  draft.exercises.forEach((e, ei) => {
+    const bw = model.exercises.get(e.exerciseId)?.bodyweight;
+    html += `<div class="card"><div class="row"><span class="ex-name grow">${esc(exName(e.exerciseId))}</span>
+      <button class="small danger" data-act="rmEx" data-ei="${ei}">Remove</button></div>
+      <table><tr><th>#</th><th>Reps</th><th>${bw ? '+kg' : 'kg'}</th><th>Kind</th><th></th></tr>`;
+    e.sets.forEach((s, si) => {
+      html += `<tr><td>${si + 1}</td>
+        <td><input inputmode="numeric" data-ei="${ei}" data-si="${si}" data-f="reps" value="${esc(s.reps)}"></td>
+        <td><input inputmode="decimal" data-ei="${ei}" data-si="${si}" data-f="kg" value="${esc(s.kg)}"></td>
+        <td><select data-ei="${ei}" data-si="${si}" data-f="kind">${SET_KINDS.map(k => `<option ${k === s.kind ? 'selected' : ''}>${k}</option>`).join('')}</select></td>
+        <td><button class="small" data-act="rmSet" data-ei="${ei}" data-si="${si}" aria-label="Remove set">✕</button></td></tr>`;
+    });
+    html += `</table><button class="small" data-act="addSet" data-ei="${ei}">+ Set</button></div>`;
+  });
+  html += `<div class="card">`;
+  if (exList.length) {
+    html += `<div class="row"><select id="dAddEx" class="grow">${exList.map(x => `<option value="${esc(x.id)}">${esc(x.name)}</option>`).join('')}</select>
+      <button id="dAddExBtn">+ Exercise</button></div>`;
+  } else html += `<p class="muted">Add exercises in the Exercises tab first.</p>`;
+  html += `</div><div class="row"><button class="primary grow" id="dSave" ${draft.exercises.length ? '' : 'disabled'}>Save workout</button>
+    <button id="dClear">Discard</button></div>`;
+  $('tab-log').innerHTML = html;
+}
+
+function setSummary(s) {
+  const kind = s.kind && s.kind !== 'work' ? ` <span class="tag">${esc(s.kind)}</span>` : '';
+  return `${esc(s.reps)} × ${esc(s.kg)} kg${kind}`;
+}
+function renderHistory() {
+  if (!model.workouts.length) { $('tab-history').innerHTML = `<div class="card muted">No workouts yet.</div>`; return; }
+  $('tab-history').innerHTML = model.workouts.map(w => {
+    const d = new Date(w.start);
+    const when = isNaN(d) ? esc(w.start) : d.toLocaleString(undefined, { weekday: 'short', year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+    const ex = (w.exercises || []).map(e => `<li><span class="ex-name">${esc(exName(e.exerciseId))}</span><br>
+      <span class="muted">${(e.sets || []).map(setSummary).join(' · ')}</span></li>`).join('');
+    const notes = w.notes.map(n => `<li class="muted">Note: ${esc(n.text)}</li>`).join('');
+    return `<div class="card"><div class="row"><strong class="grow">${when}</strong>
+      <button class="small" data-act="note" data-id="${esc(w.id)}">+ Note</button>
+      <button class="small danger" data-act="voidW" data-id="${esc(w.id)}">Remove</button></div>
+      <ul class="plain">${ex}${notes}</ul></div>`;
+  }).join('');
+}
+function renderExercises() {
+  const list = sortedExercises().map(x => `<li class="row"><span class="grow">${esc(x.name)} ${x.bodyweight ? '<span class="tag">bodyweight</span>' : ''}</span>
+    <button class="small" data-act="rename" data-id="${esc(x.id)}">Rename</button></li>`).join('');
+  $('tab-exercises').innerHTML = `<div class="card"><label>New exercise</label>
+    <div class="row"><input id="xName" class="grow" placeholder="e.g. Bench press"></div>
+    <div class="row" style="margin-top:8px"><label style="margin:0"><input type="checkbox" id="xBw"> Bodyweight (kg = added load)</label></div>
+    <button class="primary" id="xAdd" style="margin-top:10px">Add exercise</button></div>
+    <div class="card">${list ? `<ul class="plain">${list}</ul>` : '<span class="muted">No exercises yet.</span>'}</div>`;
+}
+
+// ===== Actions =====
+const num = s => Number(String(s).trim().replace(',', '.'));
+
+async function saveWorkout() {
+  const start = new Date(draft.start);
+  if (isNaN(start)) return status('Set a valid start time.', true);
+  const exercises = [];
+  for (const e of draft.exercises) {
+    const sets = [];
+    for (const [i, s] of e.sets.entries()) {
+      const reps = num(s.reps), kg = num(s.kg);
+      if (!Number.isInteger(reps) || reps <= 0) return status(`${exName(e.exerciseId)}, set ${i + 1}: reps must be a whole number above 0.`, true);
+      if (!Number.isFinite(kg) || kg < 0) return status(`${exName(e.exerciseId)}, set ${i + 1}: kg must be 0 or more.`, true);
+      const set = { reps, kg };
+      if (s.kind && s.kind !== 'work') set.kind = s.kind;
+      sets.push(set);
+    }
+    if (sets.length) exercises.push({ exerciseId: e.exerciseId, sets });
+  }
+  if (!exercises.length) return status('Add at least one set.', true);
+  try {
+    $('dSave').disabled = true;
+    await appendRow('workout', '', { start: isoLocal(start, false), exercises });
+    draft = newDraft(); saveDraft(); renderLog();
+    status('Workout saved.');
+  } catch (e) { handleError(e); renderLog(); }
+}
+
+async function addExercise() {
+  const name = $('xName').value.trim();
+  if (!name) return status('Enter a name.', true);
+  if (sortedExercises().some(x => x.name.toLowerCase() === name.toLowerCase())) return status('That exercise already exists.', true);
+  try { await appendRow('exercise', '', { name, bodyweight: $('xBw').checked }); status('Exercise added.'); }
+  catch (e) { handleError(e); }
+}
+
+async function renameExercise(id) {
+  const old = exName(id), name = prompt(`New name for "${old}":`, old)?.trim();
+  if (!name || name === old) return;
+  try { await appendRow('correction', id, { path: 'name', value: name }); status('Renamed.'); } catch (e) { handleError(e); }
+}
+
+async function addNote(id) {
+  const text = prompt('Note for this workout:')?.trim();
+  if (!text) return;
+  try { await appendRow('note', id, { text }); status('Note added.'); } catch (e) { handleError(e); }
+}
+
+async function voidWorkout(id) {
+  if (!confirm('Remove this workout? It stays in the sheet but is hidden here.')) return;
+  try { await appendRow('void', id, { reason: 'removed in app' }); status('Workout removed.'); } catch (e) { handleError(e); }
+}
+
+// ===== Events =====
+document.addEventListener('click', e => {
+  const t = e.target.closest('button'); if (!t) return;
+  if (t.id === 'btnSignin') return signIn();
+  if (t.id === 'btnPick') return pickFolder();
+  if (t.dataset.tab) {
+    document.querySelectorAll('nav button').forEach(b => b.classList.toggle('active', b === t));
+    for (const n of ['log', 'history', 'exercises']) $('tab-' + n).hidden = n !== t.dataset.tab;
+    return;
+  }
+  if (t.id === 'dNow') { draft.start = inputLocal(new Date()); saveDraft(); return renderLog(); }
+  if (t.id === 'dAddExBtn') { draft.exercises.push({ exerciseId: $('dAddEx').value, sets: [{ reps: '', kg: '', kind: 'work' }] }); saveDraft(); return renderLog(); }
+  if (t.id === 'dSave') return saveWorkout();
+  if (t.id === 'dClear') { if (confirm('Discard this unsaved workout?')) { draft = newDraft(); saveDraft(); renderLog(); } return; }
+  if (t.id === 'xAdd') return addExercise();
+  const ei = Number(t.dataset.ei), si = Number(t.dataset.si);
+  switch (t.dataset.act) {
+    case 'addSet': { const sets = draft.exercises[ei].sets; sets.push({ ...(sets.at(-1) || { reps: '', kg: '', kind: 'work' }) }); break; }
+    case 'rmSet': draft.exercises[ei].sets.splice(si, 1); break;
+    case 'rmEx': draft.exercises.splice(ei, 1); break;
+    case 'rename': return renameExercise(t.dataset.id);
+    case 'note': return addNote(t.dataset.id);
+    case 'voidW': return voidWorkout(t.dataset.id);
+    default: return;
+  }
+  saveDraft(); renderLog();
+});
+document.addEventListener('input', e => {
+  const t = e.target;
+  if (t.id === 'dStart') { draft.start = t.value; return saveDraft(); }
+  if (t.dataset.f && t.dataset.ei !== undefined) { draft.exercises[Number(t.dataset.ei)].sets[Number(t.dataset.si)][t.dataset.f] = t.value; saveDraft(); }
+});
+
+draft = loadDraft();
+waitForGoogle();
+</script>
+</body>
+</html>
