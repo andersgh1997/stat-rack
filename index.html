@@ -13,11 +13,12 @@
   header { display:flex; align-items:center; justify-content:space-between; padding:12px 16px; border-bottom:1px solid var(--line); }
   header h1 { font-size:20px; margin:0; }
   main { max-width:640px; margin:0 auto; padding:16px; }
-  section.card, .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:14px; margin-bottom:14px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:14px; margin-bottom:14px; }
   nav { display:flex; gap:6px; margin-bottom:14px; }
   nav button { flex:1; }
   nav button.active { background:var(--accent); color:#fff; border-color:var(--accent); }
   button { font:inherit; padding:10px 14px; border-radius:8px; border:1px solid var(--line); background:var(--card); color:var(--ink); cursor:pointer; min-height:44px; }
+  button:disabled { opacity:.5; cursor:default; }
   button.primary { background:var(--accent); color:#fff; border-color:var(--accent); }
   button.small { padding:4px 10px; min-height:34px; font-size:14px; }
   button.danger { color:var(--danger); }
@@ -25,18 +26,17 @@
   label { display:block; margin:8px 0 4px; color:var(--muted); font-size:14px; }
   .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
   .grow { flex:1; min-width:0; }
-  table { width:100%; border-collapse:collapse; }
-  td, th { padding:4px; text-align:left; }
-  th { color:var(--muted); font-weight:500; font-size:13px; }
-  td input { width:100%; }
+  .num { width:4.5em; }
   .muted { color:var(--muted); font-size:14px; }
   .tag { font-size:12px; border:1px solid var(--line); border-radius:999px; padding:1px 8px; color:var(--muted); }
-  #status { position:fixed; left:50%; bottom:16px; transform:translateX(-50%); max-width:90%; padding:10px 14px; border-radius:8px; background:var(--ink); color:var(--bg); display:none; }
+  #status { position:fixed; left:50%; bottom:16px; transform:translateX(-50%); max-width:90%; padding:10px 14px; border-radius:8px; background:var(--ink); color:var(--bg); display:none; z-index:10; }
   #status.error { background:var(--danger); color:#fff; }
   .ex-name { font-weight:600; }
   ul.plain { list-style:none; padding:0; margin:0; }
-  ul.plain li { padding:8px 0; border-bottom:1px solid var(--line); }
-  ul.plain li:last-child { border-bottom:none; }
+  ul.plain > li { padding:8px 0; border-bottom:1px solid var(--line); }
+  ul.plain > li:last-child { border-bottom:none; }
+  .set { display:flex; gap:8px; align-items:center; padding:4px 0; }
+  .set .n { width:1.6em; color:var(--muted); }
 </style>
 <script src="https://accounts.google.com/gsi/client" async defer></script>
 <script src="https://apis.google.com/js/api.js" async defer></script>
@@ -57,11 +57,11 @@
 
   <div id="viewApp" hidden>
     <nav>
-      <button data-tab="log" class="active">Log workout</button>
+      <button data-tab="workout" class="active">Workout</button>
       <button data-tab="history">History</button>
       <button data-tab="exercises">Exercises</button>
     </nav>
-    <div id="tab-log"></div>
+    <div id="tab-workout"></div>
     <div id="tab-history" hidden></div>
     <div id="tab-exercises" hidden></div>
   </div>
@@ -81,17 +81,20 @@ const CONFIG = {
 const LOG_COLUMNS = ['id', 'type', 'ref', 'v', 'written', 'data'];
 const SHEET = 'log';
 // Version written for each type today. Bump when a format changes and add an upgrader below.
-const WRITE_VERSION = { exercise: 1, workout: 1, note: 1, correction: 1, void: 1 };
+const WRITE_VERSION = { exercise: 1, workout: 1, set: 1, note: 1, correction: 1, void: 1 };
 // UPGRADERS[type][v] turns data of version v into version v+1. Written once, never changed.
-const UPGRADERS = { workout: {}, exercise: {}, note: {} };
+const UPGRADERS = { exercise: {}, workout: {}, set: {}, note: {} };
 const SET_KINDS = ['work', 'warmup', 'test']; // 'work' is stored as no kind at all
+const EQUIPMENT = ['barbell', 'dumbbell', 'machine', 'cable', 'bodyweight', 'other'];
 
 // ===== State =====
 let tokenClient = null, token = null, tokenExpiry = 0;
 let logFiles = [];   // [{id, name, seq, header}]
-let rows = [];       // raw rows from all log files
-let model = { exercises: new Map(), workouts: [] };
-let draft = null; // set at startup, see the bottom of the script
+let rows = [];       // raw rows from all log files, in saved order
+let model = { exercises: new Map(), workouts: [], workoutById: new Map() };
+let session = null;  // set at startup: {activeId, pending:{[workoutId]:[exerciseId]}, inputs:{[key]:{reps,kg,kind}}}
+let editingSetId = null;
+let busy = false;
 
 const $ = id => document.getElementById(id);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -121,6 +124,10 @@ function newId() {
   const r = crypto.getRandomValues(new Uint8Array(3));
   const rand = Array.from(r, b => chars[b % chars.length]).join('');
   return `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}-${rand}`;
+}
+function fmtWhen(s) {
+  const d = new Date(s);
+  return isNaN(d) ? esc(s) : d.toLocaleString(undefined, { weekday: 'short', year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
 }
 
 // ===== Auth =====
@@ -252,8 +259,15 @@ async function appendRow(type, ref, data) {
   });
   rows.push({ ...row, file: target.id, data, raw: row.data, ok: true });
   rebuild();
-  renderAll();
   return row.id;
+}
+// Wraps a write so double taps can't save twice, and re-renders afterwards.
+async function write(fn, okMsg) {
+  if (busy) return;
+  busy = true; renderAll();
+  try { await fn(); if (okMsg) status(okMsg); }
+  catch (e) { handleError(e); }
+  finally { busy = false; renderAll(); }
 }
 
 // ===== Reading the log into a model =====
@@ -289,179 +303,264 @@ function rebuild() {
   };
   const live = good.filter(r => !isVoided(r.id));
   // 2. Corrections on the original format, oldest first
-  const items = new Map();
-  for (const r of live) if (r.type === 'exercise' || r.type === 'workout') items.set(r.id, { ...r, data: structuredClone(r.data) });
+  const items = new Map(); // keeps saved order
+  for (const r of live) if (['exercise', 'workout', 'set'].includes(r.type)) items.set(r.id, { ...r, data: structuredClone(r.data) });
   for (const c of live.filter(r => r.type === 'correction').sort((a, b) => time(a.written) - time(b.written))) {
     const t = items.get(c.ref);
     if (t && c.data && 'path' in c.data) setPath(t.data, c.data.path, c.data.value);
   }
-  // 3. Upgrade to the newest format (in memory only)
-  const exercises = new Map(), workouts = [];
+  // 3. Upgrade to the newest format (in memory only), then 4. assemble
+  const exercises = new Map(), workoutById = new Map(), setById = new Map();
   for (const it of items.values()) {
     const data = upgrade(it.type, it.v, it.data);
     if (it.type === 'exercise') exercises.set(it.id, { id: it.id, ...data });
-    else workouts.push({ id: it.id, written: it.written, ...data, notes: [] });
+    else if (it.type === 'workout') workoutById.set(it.id, { id: it.id, ...data, sets: [], notes: [] });
   }
-  // 4. Notes
-  const byId = new Map(workouts.map(w => [w.id, w]));
-  for (const n of live.filter(r => r.type === 'note')) byId.get(n.ref)?.notes.push({ id: n.id, ...upgrade('note', n.v, n.data) });
-  workouts.sort((a, b) => time(b.start) - time(a.start));
-  model = { exercises, workouts };
+  for (const it of items.values()) {
+    if (it.type !== 'set') continue;
+    const w = workoutById.get(it.ref);
+    if (!w) continue; // its workout is voided or unknown
+    const s = { id: it.id, ...upgrade('set', it.v, it.data), notes: [] };
+    w.sets.push(s); setById.set(s.id, s);
+  }
+  for (const n of live.filter(r => r.type === 'note')) {
+    const note = { id: n.id, ...upgrade('note', n.v, n.data) };
+    (workoutById.get(n.ref) || setById.get(n.ref))?.notes.push(note);
+  }
+  const workouts = [...workoutById.values()].sort((a, b) => time(b.start) - time(a.start));
+  model = { exercises, workouts, workoutById };
+}
+// Sets of a workout grouped by exercise, in the order each exercise first appeared.
+function groupSets(w) {
+  const groups = new Map();
+  for (const s of w.sets) { if (!groups.has(s.exerciseId)) groups.set(s.exerciseId, []); groups.get(s.exerciseId).push(s); }
+  return groups;
 }
 
-// ===== Draft (survives a reload or a locked phone mid-workout) =====
-function newDraft() { return { start: inputLocal(new Date()), exercises: [] }; }
-function loadDraft() { try { return JSON.parse(localStorage.getItem('statrack.draft')) || newDraft(); } catch { return newDraft(); } }
-function saveDraft() { try { localStorage.setItem('statrack.draft', JSON.stringify(draft)); } catch {} }
+// ===== Session (kept on this device: which workout is open, unsaved inputs) =====
+function newSession() { return { activeId: null, pending: {}, inputs: {} }; }
+function loadSession() { try { return { ...newSession(), ...JSON.parse(localStorage.getItem('statrack.session')) }; } catch { return newSession(); } }
+function saveSession() { try { localStorage.setItem('statrack.session', JSON.stringify(session)); } catch {} }
+const inputKey = (wid, eid) => `${wid}|${eid}`;
 
 // ===== Rendering =====
-function exName(id) { return model.exercises.get(id)?.name ?? '(unknown exercise)'; }
-function sortedExercises() { return [...model.exercises.values()].sort((a, b) => a.name.localeCompare(b.name)); }
-function renderAll() { renderLog(); renderHistory(); renderExercises(); }
-
-function renderLog() {
-  const exList = sortedExercises();
-  let html = `<div class="card"><label>Start</label><input type="datetime-local" id="dStart" value="${esc(draft.start)}">`;
-  html += `<button class="small" id="dNow" style="margin-left:6px">Now</button></div>`;
-  draft.exercises.forEach((e, ei) => {
-    const bw = model.exercises.get(e.exerciseId)?.bodyweight;
-    html += `<div class="card"><div class="row"><span class="ex-name grow">${esc(exName(e.exerciseId))}</span>
-      <button class="small danger" data-act="rmEx" data-ei="${ei}">Remove</button></div>
-      <table><tr><th>#</th><th>Reps</th><th>${bw ? '+kg' : 'kg'}</th><th>Kind</th><th></th></tr>`;
-    e.sets.forEach((s, si) => {
-      html += `<tr><td>${si + 1}</td>
-        <td><input inputmode="numeric" data-ei="${ei}" data-si="${si}" data-f="reps" value="${esc(s.reps)}"></td>
-        <td><input inputmode="decimal" data-ei="${ei}" data-si="${si}" data-f="kg" value="${esc(s.kg)}"></td>
-        <td><select data-ei="${ei}" data-si="${si}" data-f="kind">${SET_KINDS.map(k => `<option ${k === s.kind ? 'selected' : ''}>${k}</option>`).join('')}</select></td>
-        <td><button class="small" data-act="rmSet" data-ei="${ei}" data-si="${si}" aria-label="Remove set">✕</button></td></tr>`;
-    });
-    html += `</table><button class="small" data-act="addSet" data-ei="${ei}">+ Set</button></div>`;
-  });
-  html += `<div class="card">`;
-  if (exList.length) {
-    html += `<div class="row"><select id="dAddEx" class="grow">${exList.map(x => `<option value="${esc(x.id)}">${esc(x.name)}</option>`).join('')}</select>
-      <button id="dAddExBtn">+ Exercise</button></div>`;
-  } else html += `<p class="muted">Add exercises in the Exercises tab first.</p>`;
-  html += `</div><div class="row"><button class="primary grow" id="dSave" ${draft.exercises.length ? '' : 'disabled'}>Save workout</button>
-    <button id="dClear">Discard</button></div>`;
-  $('tab-log').innerHTML = html;
+function exLabel(id) {
+  const x = model.exercises.get(id);
+  if (!x) return '(unknown exercise)';
+  return x.equipment ? `${x.name} · ${x.equipment}` : x.name;
 }
+function sortedExercises() {
+  return [...model.exercises.values()].sort((a, b) => a.name.localeCompare(b.name) || String(a.equipment).localeCompare(String(b.equipment)));
+}
+function renderAll() { renderWorkout(); renderHistory(); renderExercises(); }
 
-function setSummary(s) {
+function setText(s) {
   const kind = s.kind && s.kind !== 'work' ? ` <span class="tag">${esc(s.kind)}</span>` : '';
   return `${esc(s.reps)} × ${esc(s.kg)} kg${kind}`;
 }
+function kindSelect(attrs, value) {
+  return `<select ${attrs}>${SET_KINDS.map(k => `<option ${k === (value || 'work') ? 'selected' : ''}>${k}</option>`).join('')}</select>`;
+}
+
+function renderWorkout() {
+  const el = $('tab-workout');
+  const w = session.activeId && model.workoutById.get(session.activeId);
+  if (!w) {
+    el.innerHTML = `<div class="card"><label>Start time</label>
+      <div class="row"><input type="datetime-local" id="wStart" class="grow" value="${esc(inputLocal(new Date()))}"></div>
+      <button class="primary" id="wStartBtn" style="margin-top:10px;width:100%" ${busy ? 'disabled' : ''}>Start workout</button></div>`;
+    return;
+  }
+  const groups = groupSets(w);
+  for (const eid of session.pending[w.id] || []) if (!groups.has(eid)) groups.set(eid, []);
+  let html = `<div class="card"><div class="row"><strong class="grow">${fmtWhen(w.start)}</strong>
+    <button class="small" data-act="note" data-id="${esc(w.id)}">+ Note</button>
+    <button class="small primary" id="wFinish">Finish</button></div>
+    ${w.notes.map(n => `<div class="muted">Note: ${esc(n.text)}</div>`).join('')}</div>`;
+  for (const [eid, sets] of groups) {
+    const bw = model.exercises.get(eid)?.bodyweight;
+    const key = inputKey(w.id, eid);
+    const last = sets.at(-1);
+    const inp = session.inputs[key] || (last ? { reps: String(last.reps), kg: String(last.kg), kind: last.kind || 'work' } : { reps: '', kg: '', kind: 'work' });
+    html += `<div class="card"><div class="ex-name">${esc(exLabel(eid))}</div>`;
+    sets.forEach((s, i) => {
+      if (editingSetId === s.id) {
+        html += `<div class="set"><span class="n">${i + 1}</span>
+          <input class="num" inputmode="numeric" id="eReps" value="${esc(s.reps)}">
+          <input class="num" inputmode="decimal" id="eKg" value="${esc(s.kg)}">
+          ${kindSelect('id="eKind"', s.kind)}
+          <button class="small primary" data-act="saveEdit" data-id="${esc(s.id)}" ${busy ? 'disabled' : ''}>Save</button>
+          <button class="small" data-act="cancelEdit">Cancel</button></div>`;
+      } else {
+        html += `<div class="set"><span class="n">${i + 1}</span><span class="grow">${setText(s)}</span>
+          <button class="small" data-act="editSet" data-id="${esc(s.id)}">Edit</button>
+          <button class="small danger" data-act="voidSet" data-id="${esc(s.id)}" aria-label="Remove set">✕</button></div>
+          ${s.notes.map(n => `<div class="muted" style="margin-left:2em">Note: ${esc(n.text)}</div>`).join('')}`;
+      }
+    });
+    html += `<div class="set"><span class="n">${sets.length + 1}</span>
+      <input class="num" inputmode="numeric" placeholder="reps" data-key="${esc(key)}" data-f="reps" value="${esc(inp.reps)}">
+      <input class="num" inputmode="decimal" placeholder="${bw ? '+kg' : 'kg'}" data-key="${esc(key)}" data-f="kg" value="${esc(inp.kg)}">
+      ${kindSelect(`data-key="${esc(key)}" data-f="kind"`, inp.kind)}
+      <button class="small primary" data-act="addSet" data-eid="${esc(eid)}" ${busy ? 'disabled' : ''}>Save set</button></div></div>`;
+  }
+  const exList = sortedExercises();
+  html += `<div class="card">${exList.length
+    ? `<div class="row"><select id="wAddEx" class="grow">${exList.map(x => `<option value="${esc(x.id)}">${esc(exLabel(x.id))}</option>`).join('')}</select>
+       <button id="wAddExBtn">+ Exercise</button></div>`
+    : `<p class="muted">Add exercises in the Exercises tab first.</p>`}</div>`;
+  el.innerHTML = html;
+}
+
 function renderHistory() {
   if (!model.workouts.length) { $('tab-history').innerHTML = `<div class="card muted">No workouts yet.</div>`; return; }
   $('tab-history').innerHTML = model.workouts.map(w => {
-    const d = new Date(w.start);
-    const when = isNaN(d) ? esc(w.start) : d.toLocaleString(undefined, { weekday: 'short', year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
-    const ex = (w.exercises || []).map(e => `<li><span class="ex-name">${esc(exName(e.exerciseId))}</span><br>
-      <span class="muted">${(e.sets || []).map(setSummary).join(' · ')}</span></li>`).join('');
+    const ex = [...groupSets(w)].map(([eid, sets]) => `<li><span class="ex-name">${esc(exLabel(eid))}</span><br>
+      <span class="muted">${sets.map(setText).join(' · ')}</span></li>`).join('');
     const notes = w.notes.map(n => `<li class="muted">Note: ${esc(n.text)}</li>`).join('');
-    return `<div class="card"><div class="row"><strong class="grow">${when}</strong>
-      <button class="small" data-act="note" data-id="${esc(w.id)}">+ Note</button>
+    const isActive = w.id === session.activeId;
+    return `<div class="card"><div class="row"><strong class="grow">${fmtWhen(w.start)}${isActive ? ' <span class="tag">open</span>' : ''}</strong>
+      <button class="small" data-act="open" data-id="${esc(w.id)}">Open</button>
       <button class="small danger" data-act="voidW" data-id="${esc(w.id)}">Remove</button></div>
-      <ul class="plain">${ex}${notes}</ul></div>`;
+      <ul class="plain">${ex || '<li class="muted">No sets.</li>'}${notes}</ul></div>`;
   }).join('');
 }
+
 function renderExercises() {
-  const list = sortedExercises().map(x => `<li class="row"><span class="grow">${esc(x.name)} ${x.bodyweight ? '<span class="tag">bodyweight</span>' : ''}</span>
+  const list = sortedExercises().map(x => `<li class="row"><span class="grow">${esc(x.name)}
+      ${x.equipment ? `<span class="tag">${esc(x.equipment)}</span>` : ''} ${x.bodyweight ? '<span class="tag">bodyweight</span>' : ''}</span>
     <button class="small" data-act="rename" data-id="${esc(x.id)}">Rename</button></li>`).join('');
-  $('tab-exercises').innerHTML = `<div class="card"><label>New exercise</label>
-    <div class="row"><input id="xName" class="grow" placeholder="e.g. Bench press"></div>
-    <div class="row" style="margin-top:8px"><label style="margin:0"><input type="checkbox" id="xBw"> Bodyweight (kg = added load)</label></div>
-    <button class="primary" id="xAdd" style="margin-top:10px">Add exercise</button></div>
+  $('tab-exercises').innerHTML = `<div class="card"><label>Name</label>
+    <div class="row"><input id="xName" class="grow" placeholder="e.g. Bench press, Incline bench press"></div>
+    <label>Equipment</label>
+    <div class="row"><select id="xEq" class="grow">${EQUIPMENT.map(e => `<option>${e}</option>`).join('')}</select></div>
+    <div class="row" style="margin-top:8px"><label style="margin:0"><input type="checkbox" id="xBw"> Bodyweight exercise (kg = added load)</label></div>
+    <p class="muted">Dumbbells: kg is the weight of one dumbbell.</p>
+    <button class="primary" id="xAdd" ${busy ? 'disabled' : ''}>Add exercise</button></div>
     <div class="card">${list ? `<ul class="plain">${list}</ul>` : '<span class="muted">No exercises yet.</span>'}</div>`;
 }
 
 // ===== Actions =====
 const num = s => Number(String(s).trim().replace(',', '.'));
-
-async function saveWorkout() {
-  const start = new Date(draft.start);
-  if (isNaN(start)) return status('Set a valid start time.', true);
-  const exercises = [];
-  for (const e of draft.exercises) {
-    const sets = [];
-    for (const [i, s] of e.sets.entries()) {
-      const reps = num(s.reps), kg = num(s.kg);
-      if (!Number.isInteger(reps) || reps <= 0) return status(`${exName(e.exerciseId)}, set ${i + 1}: reps must be a whole number above 0.`, true);
-      if (!Number.isFinite(kg) || kg < 0) return status(`${exName(e.exerciseId)}, set ${i + 1}: kg must be 0 or more.`, true);
-      const set = { reps, kg };
-      if (s.kind && s.kind !== 'work') set.kind = s.kind;
-      sets.push(set);
-    }
-    if (sets.length) exercises.push({ exerciseId: e.exerciseId, sets });
-  }
-  if (!exercises.length) return status('Add at least one set.', true);
-  try {
-    $('dSave').disabled = true;
-    await appendRow('workout', '', { start: isoLocal(start, false), exercises });
-    draft = newDraft(); saveDraft(); renderLog();
-    status('Workout saved.');
-  } catch (e) { handleError(e); renderLog(); }
+function parseSet(reps, kg) {
+  const r = num(reps), k = num(kg);
+  if (!Number.isInteger(r) || r <= 0) return 'Reps must be a whole number above 0.';
+  if (String(kg).trim() === '' || !Number.isFinite(k) || k < 0) return 'kg must be 0 or more.';
+  return { reps: r, kg: k };
 }
 
-async function addExercise() {
-  const name = $('xName').value.trim();
+function startWorkout() {
+  const d = new Date($('wStart').value);
+  if (isNaN(d)) return status('Set a valid start time.', true);
+  write(async () => {
+    const id = await appendRow('workout', '', { start: isoLocal(d, false) });
+    session.activeId = id; saveSession();
+  }, 'Workout started.');
+}
+
+function addSet(eid) {
+  const w = model.workoutById.get(session.activeId); if (!w) return;
+  const key = inputKey(w.id, eid);
+  const inp = session.inputs[key] || {};
+  const box = document.querySelectorAll(`[data-key="${CSS.escape(key)}"]`);
+  const val = f => [...box].find(b => b.dataset.f === f)?.value ?? inp[f] ?? '';
+  const p = parseSet(val('reps'), val('kg'));
+  if (typeof p === 'string') return status(p, true);
+  const kind = val('kind');
+  const data = { exerciseId: eid, ...p };
+  if (kind && kind !== 'work') data.kind = kind;
+  write(async () => {
+    await appendRow('set', w.id, data);
+    session.inputs[key] = { reps: String(p.reps), kg: String(p.kg), kind: kind || 'work' }; // pre-fill the next set
+    session.pending[w.id] = (session.pending[w.id] || []).filter(x => x !== eid);
+    saveSession();
+  }, 'Set saved.');
+}
+
+function saveEdit(setId) {
+  const w = model.workoutById.get(session.activeId);
+  const s = w?.sets.find(x => x.id === setId); if (!s) return;
+  const p = parseSet($('eReps').value, $('eKg').value);
+  if (typeof p === 'string') return status(p, true);
+  const kind = $('eKind').value;
+  const changes = [];
+  if (p.reps !== s.reps) changes.push({ path: 'reps', value: p.reps });
+  if (p.kg !== s.kg) changes.push({ path: 'kg', value: p.kg });
+  if ((kind || 'work') !== (s.kind || 'work')) changes.push({ path: 'kind', value: kind === 'work' ? null : kind });
+  if (!changes.length) { editingSetId = null; return renderWorkout(); }
+  write(async () => {
+    for (const c of changes) await appendRow('correction', setId, c);
+    editingSetId = null;
+  }, 'Set corrected.');
+}
+
+function addExercise() {
+  const name = $('xName').value.trim(), equipment = $('xEq').value, bodyweight = $('xBw').checked;
   if (!name) return status('Enter a name.', true);
-  if (sortedExercises().some(x => x.name.toLowerCase() === name.toLowerCase())) return status('That exercise already exists.', true);
-  try { await appendRow('exercise', '', { name, bodyweight: $('xBw').checked }); status('Exercise added.'); }
-  catch (e) { handleError(e); }
+  if (sortedExercises().some(x => x.name.toLowerCase() === name.toLowerCase() && x.equipment === equipment))
+    return status(`${name} · ${equipment} already exists.`, true);
+  write(() => appendRow('exercise', '', { name, equipment, bodyweight }), 'Exercise added.');
 }
 
-async function renameExercise(id) {
-  const old = exName(id), name = prompt(`New name for "${old}":`, old)?.trim();
+function renameExercise(id) {
+  const old = model.exercises.get(id)?.name ?? '';
+  const name = prompt(`New name for "${old}":`, old)?.trim();
   if (!name || name === old) return;
-  try { await appendRow('correction', id, { path: 'name', value: name }); status('Renamed.'); } catch (e) { handleError(e); }
+  write(() => appendRow('correction', id, { path: 'name', value: name }), 'Renamed.');
 }
 
-async function addNote(id) {
-  const text = prompt('Note for this workout:')?.trim();
+function addNote(ref) {
+  const text = prompt('Note:')?.trim();
   if (!text) return;
-  try { await appendRow('note', id, { text }); status('Note added.'); } catch (e) { handleError(e); }
+  write(() => appendRow('note', ref, { text }), 'Note added.');
 }
 
-async function voidWorkout(id) {
-  if (!confirm('Remove this workout? It stays in the sheet but is hidden here.')) return;
-  try { await appendRow('void', id, { reason: 'removed in app' }); status('Workout removed.'); } catch (e) { handleError(e); }
+function voidRow(id, question, msg) {
+  if (!confirm(question)) return;
+  write(() => appendRow('void', id, { reason: 'removed in app' }), msg);
+}
+
+function switchTab(name) {
+  document.querySelectorAll('nav button').forEach(b => b.classList.toggle('active', b.dataset.tab === name));
+  for (const n of ['workout', 'history', 'exercises']) $('tab-' + n).hidden = n !== name;
 }
 
 // ===== Events =====
 document.addEventListener('click', e => {
-  const t = e.target.closest('button'); if (!t) return;
+  const t = e.target.closest('button'); if (!t || t.disabled) return;
   if (t.id === 'btnSignin') return signIn();
   if (t.id === 'btnPick') return pickFolder();
-  if (t.dataset.tab) {
-    document.querySelectorAll('nav button').forEach(b => b.classList.toggle('active', b === t));
-    for (const n of ['log', 'history', 'exercises']) $('tab-' + n).hidden = n !== t.dataset.tab;
-    return;
+  if (t.dataset.tab) return switchTab(t.dataset.tab);
+  if (t.id === 'wStartBtn') return startWorkout();
+  if (t.id === 'wFinish') { session.activeId = null; saveSession(); renderAll(); return status('Workout finished.'); }
+  if (t.id === 'wAddExBtn') {
+    const eid = $('wAddEx').value, wid = session.activeId;
+    session.pending[wid] = [...new Set([...(session.pending[wid] || []), eid])];
+    saveSession(); return renderWorkout();
   }
-  if (t.id === 'dNow') { draft.start = inputLocal(new Date()); saveDraft(); return renderLog(); }
-  if (t.id === 'dAddExBtn') { draft.exercises.push({ exerciseId: $('dAddEx').value, sets: [{ reps: '', kg: '', kind: 'work' }] }); saveDraft(); return renderLog(); }
-  if (t.id === 'dSave') return saveWorkout();
-  if (t.id === 'dClear') { if (confirm('Discard this unsaved workout?')) { draft = newDraft(); saveDraft(); renderLog(); } return; }
   if (t.id === 'xAdd') return addExercise();
-  const ei = Number(t.dataset.ei), si = Number(t.dataset.si);
+  const id = t.dataset.id;
   switch (t.dataset.act) {
-    case 'addSet': { const sets = draft.exercises[ei].sets; sets.push({ ...(sets.at(-1) || { reps: '', kg: '', kind: 'work' }) }); break; }
-    case 'rmSet': draft.exercises[ei].sets.splice(si, 1); break;
-    case 'rmEx': draft.exercises.splice(ei, 1); break;
-    case 'rename': return renameExercise(t.dataset.id);
-    case 'note': return addNote(t.dataset.id);
-    case 'voidW': return voidWorkout(t.dataset.id);
-    default: return;
+    case 'addSet': return addSet(t.dataset.eid);
+    case 'editSet': editingSetId = id; return renderWorkout();
+    case 'cancelEdit': editingSetId = null; return renderWorkout();
+    case 'saveEdit': return saveEdit(id);
+    case 'voidSet': return voidRow(id, 'Remove this set? It stays in the sheet but is hidden here.', 'Set removed.');
+    case 'voidW': return voidRow(id, 'Remove this workout and its sets? They stay in the sheet but are hidden here.', 'Workout removed.');
+    case 'note': return addNote(id);
+    case 'open': session.activeId = id; saveSession(); renderAll(); return switchTab('workout');
+    case 'rename': return renameExercise(id);
   }
-  saveDraft(); renderLog();
 });
 document.addEventListener('input', e => {
   const t = e.target;
-  if (t.id === 'dStart') { draft.start = t.value; return saveDraft(); }
-  if (t.dataset.f && t.dataset.ei !== undefined) { draft.exercises[Number(t.dataset.ei)].sets[Number(t.dataset.si)][t.dataset.f] = t.value; saveDraft(); }
+  if (t.dataset.key && t.dataset.f) {
+    session.inputs[t.dataset.key] = { ...(session.inputs[t.dataset.key] || {}), [t.dataset.f]: t.value };
+    saveSession();
+  }
 });
 
-draft = loadDraft();
+session = loadSession();
 waitForGoogle();
 </script>
 </body>
